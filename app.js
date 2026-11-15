@@ -7,14 +7,17 @@ const LOCALE = 'en-US';
 const TYPES = ['project', 'feedback', 'reference', 'user'];
 const TYPE_LABEL = { user: 'User', feedback: 'Feedback', project: 'Project', reference: 'Reference' };
 const typeColor = t => TYPES.includes(t) ? `var(--t-${t})` : 'var(--t-other)';
-const VIEWS = { memories: 'Memories', graph: 'Graph', stats: 'Stats', health: 'Health' };
+const VIEWS = { memories: 'Memories', timeline: 'Timeline', graph: 'Graph', stats: 'Stats', health: 'Health' };
 const SORTS = { recent: 'Recent', reads: 'Most read', lastRead: 'Last read', name: 'Name' };
+const DOC_MODES = { doc: 'Document', raw: 'Raw' };
 
 const icon = d => `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
 const ICONS = {
   memories: icon('<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/>'),
   graph: icon('<circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="9" r="2.5"/><circle cx="9" cy="18" r="2.5"/><path d="M8.4 7l7.2 1.4M7 8.4l1.3 7.2M16.3 11l-5.6 5.4"/>'),
   stats: icon('<path d="M4 20V11M10 20V5M16 20v-6M21 20H3"/>'),
+  timeline: icon('<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>'),
+  terminal: icon('<rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="M7.5 10l2.5 2-2.5 2M12.5 15h4"/>'),
   health: icon('<path d="M3 12h4l2.5-6 5 12 2.5-6h4"/>'),
   all: icon('<path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3 13l9 5 9-5"/>'),
   refresh: icon('<path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/>'),
@@ -22,6 +25,8 @@ const ICONS = {
   plus: icon('<path d="M12 5v14M5 12h14"/>'),
   minus: icon('<path d="M5 12h14"/>'),
   fit: icon('<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>'),
+  copy: icon('<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/>'),
+  check: icon('<path d="M5 12.5l4.5 4.5L19 7"/>'),
 };
 
 let data = { projects: [], emptyDirs: [] };
@@ -30,7 +35,8 @@ let usage = { status: 'loading', data: null, progress: null };
 // view = tab; project = scope ('*' = all); selProject/file = open memory
 const state = {
   view: 'memories', project: '*', selProject: null, file: null, q: '', types: new Set(), sort: 'recent',
-  pfilter: '', graphIsolated: true, graphSize: 'reads', graphPin: null,
+  pfilter: '', tlKinds: new Set(['created', 'edited', 'read']), graphIsolated: true, graphSize: 'reads', graphPin: null,
+  docMode: localStorage.getItem('memx.docMode') === 'raw' ? 'raw' : 'doc',
 };
 
 // ---------- Routing: #/<view>/<scope>/<project>/<file> ----------
@@ -108,70 +114,96 @@ const windowText = () => {
   return w ? `${plural(w.sessions, 'session', 'sessions')} between ${fmtDate(w.from)} and ${fmtDate(w.to)}` : '';
 };
 
-// ---------- Minimal markdown ----------
-function inline(s, project) {
-  const codes = [];
-  s = s.replace(/`([^`]+)`/g, (_, c) => `\u0000${codes.push(c) - 1}\u0000`);
-  s = esc(s);
+// ---------- File view: the .md exactly as on disk, line by line, lightly styled ----------
+// Markdown markers stay visible (dimmed), so what you see is the whole file, nothing hidden.
+const mk = t => `<span class="mk">${t}</span>`;
+function srcInline(s, project) {
+  const stash = [];
+  const keep = html => `\u0001${stash.push(html) - 1}\u0001`; // protect generated HTML from later rules
+  s = s.replace(/`([^`]+)`/g, (_, c) => keep(`<code>${mk('`')}${esc(c)}${mk('`')}</code>`));
   s = s.replace(/\[\[([^\]]+)\]\]/g, (_, ref) => {
-    const m = project && findMemory(project, ref);
-    return m ? `<a href="${memHref(project.id, m.file)}">${ref}</a>`
-             : `<a class="broken" title="This memory does not exist">${ref}</a>`;
+    const m = project && findMemory(project, esc(ref));
+    return keep(mk('[[') + (m ? `<a href="${memHref(project.id, m.file)}">${esc(ref)}</a>` : `<span class="broken" title="This memory does not exist">${esc(ref)}</span>`) + mk(']]'));
   });
   s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, t, u) => {
-    if (project && /^[\w.-]+\.md$/.test(u)) {
-      const m = findMemory(project, u);
-      if (m) return `<a href="${memHref(project.id, m.file)}">${t}</a>`;
-    }
-    return /^(https?:|mailto:)/.test(u) ? `<a href="${u}" target="_blank" rel="noopener">${t}</a>` : `<a class="broken">${t}</a>`;
+    let href = null;
+    if (project && /^[\w.-]+\.md$/.test(u)) { const m = findMemory(project, esc(u)); if (m) href = memHref(project.id, m.file); }
+    else if (/^(https?:|mailto:)/.test(u)) href = u;
+    const label = href ? `<a href="${esc(href)}"${href.startsWith('#') ? '' : ' target="_blank" rel="noopener"'}>${esc(t)}</a>` : `<span class="broken">${esc(t)}</span>`;
+    return keep(mk('[') + label + mk(`](${esc(u)})`));
   });
-  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-  s = s.replace(/(^|[^*\w])\*([^*\s][^*]*)\*/g, '$1<em>$2</em>');
-  s = s.replace(/(^|\W)_([^_\s][^_]*)_(?=\W|$)/g, '$1<em>$2</em>');
-  s = s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${esc(codes[i])}</code>`);
-  return s;
+  s = s.replace(/(^|\s)(https?:\/\/[^\s<>)]+)/g, (_, p, u) => p + keep(`<a href="${esc(u)}" target="_blank" rel="noopener">${esc(u)}</a>`));
+  s = esc(s);
+  s = s.replace(/\*\*([^*]+)\*\*/g, (_, t) => `<strong>${mk('**')}${t}${mk('**')}</strong>`);
+  s = s.replace(/(^|[^*\w])\*([^*\s][^*]*)\*/g, (_, p, t) => `${p}<em>${mk('*')}${t}${mk('*')}</em>`);
+  s = s.replace(/(^|[^\w\u0001])_([^_\s][^_]*)_(?=\W|$)/g, (_, p, t) => `${p}<em>${mk('_')}${t}${mk('_')}</em>`);
+  return s.replace(/\u0001(\d+)\u0001/g, (_, i) => stash[i]);
 }
-function markdown(src, project) {
-  const lines = src.replace(/\r\n/g, '\n').split('\n');
-  let out = '', i = 0;
-  while (i < lines.length) {
-    const l = lines[i];
-    if (/^```/.test(l)) {
-      const buf = []; i++;
-      while (i < lines.length && !/^```/.test(lines[i])) buf.push(lines[i++]);
-      i++; out += `<pre><code>${esc(buf.join('\n'))}</code></pre>`; continue;
-    }
-    if (/^\s*$/.test(l)) { i++; continue; }
-    const h = l.match(/^(#{1,6})\s+(.*)/);
-    if (h) { out += `<h${h[1].length}>${inline(h[2], project)}</h${h[1].length}>`; i++; continue; }
-    if (/^(-{3,}|\*{3,})\s*$/.test(l)) { out += '<hr>'; i++; continue; }
-    if (/^>/.test(l)) {
-      const buf = [];
-      while (i < lines.length && /^>/.test(lines[i])) buf.push(lines[i++].replace(/^>\s?/, ''));
-      out += `<blockquote>${markdown(buf.join('\n'), project)}</blockquote>`; continue;
-    }
-    if (/^\s*([-*+]|\d+\.)\s+/.test(l)) {
-      const ordered = /^\s*\d+\./.test(l), items = [];
-      while (i < lines.length && /^\s*([-*+]|\d+\.)\s+/.test(lines[i])) {
-        let item = lines[i++].replace(/^\s*([-*+]|\d+\.)\s+/, '');
-        while (i < lines.length && /^\s{2,}\S/.test(lines[i]) && !/^\s*([-*+]|\d+\.)\s+/.test(lines[i])) item += ' ' + lines[i++].trim();
-        items.push(`<li>${inline(item, project)}</li>`);
-      }
-      out += ordered ? `<ol start="${parseInt(l, 10) || 1}">${items.join('')}</ol>` : `<ul>${items.join('')}</ul>`; continue;
-    }
-    if (/^\|.*\|\s*$/.test(l) && i + 1 < lines.length && /^\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
-      const row = r => r.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim());
-      const head = row(l); i += 2; const rows = [];
-      while (i < lines.length && /^\|/.test(lines[i])) rows.push(row(lines[i++]));
-      out += `<table><tr>${head.map(c => `<th>${inline(c, project)}</th>`).join('')}</tr>${rows.map(r => `<tr>${r.map(c => `<td>${inline(c, project)}</td>`).join('')}</tr>`).join('')}</table>`;
-      continue;
-    }
-    const buf = [];
-    while (i < lines.length && lines[i].trim() && !/^(#{1,6}\s|```|>|\s*([-*+]|\d+\.)\s+|\|)/.test(lines[i])) buf.push(lines[i++]);
-    if (!buf.length) buf.push(lines[i++]);
-    out += `<p>${buf.map(b => inline(b, project)).join('<br>')}</p>`;
+const unquote = v => v.replace(/^(["'])(.*)\1$/, '$2');
+function relTime(iso) {
+  const d = daysAgo(iso);
+  return d <= 0 ? 'today' : d === 1 ? 'yesterday' : d < 60 ? `${d} days ago` : `${Math.round(d / 30)} months ago`;
+}
+// Frontmatter values are shown verbatim; some get a small visual hint next to them
+function fmValue(key, val) {
+  const v = esc(val), u = unquote(val.trim());
+  if (key === 'type') return `<span class="fm-type" style="--c:${typeColor(u)}"><i></i>${v}</span>`;
+  if (key === 'name') return `<b>${v}</b>`;
+  if (/^(modified|created|updated|date)$/i.test(key) && !isNaN(Date.parse(u))) return `${v}<span class="fm-note" aria-hidden="true">${fmtDate(u)} · ${relTime(u)}</span>`;
+  return v;
+}
+function docLines(raw, project) {
+  const lines = raw.replace(/\r\n/g, '\n').split('\n');
+  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop(); // trailing newline
+  let fm = lines[0] === '---' ? 1 : 0, code = false;
+  // width of the key column (indent + key + colon), so every value starts on the same column
+  let kw = 0;
+  if (fm) for (let i = 1; i < lines.length && lines[i] !== '---'; i++) {
+    const m = lines[i].match(/^(\s*)([\w-]+):/);
+    if (m) kw = Math.max(kw, m[1].length + m[2].length + 1);
   }
-  return out;
+  return lines.map((l, i) => {
+    let cls = '', html, m;
+    if (fm === 1 && i === 0) { cls = 'fm fm-start'; html = mk('---'); }
+    else if (fm === 1 && l === '---') { cls = 'fm fm-end'; html = mk('---'); fm = 2; }
+    else if (fm === 1) {
+      cls = 'fm';
+      m = l.match(/^(\s*)([\w-]+)(:)(\s*)(.*)$/);
+      html = m ? `<span class="fm-key" style="width:${kw + 2}ch">${m[1]}<span class="fm-k">${esc(m[2])}</span>${mk(':')}${m[4]}</span><span class="fm-val">${m[5] ? fmValue(m[2], m[5]) : ''}</span>`
+               : `<span class="fm-val">${esc(l)}</span>`;
+    }
+    else if (/^\s*```/.test(l)) { code = !code; cls = 'code code-edge'; html = mk(esc(l)); }
+    else if (code) { cls = 'code'; html = esc(l); }
+    else if (!l.trim()) { cls = 'blank'; html = ''; }
+    else if ((m = l.match(/^(#{1,6})(\s+)(.*)$/))) { cls = `h h${m[1].length}`; html = mk(m[1]) + m[2] + srcInline(m[3], project); }
+    else if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(l)) { cls = 'hr'; html = mk(esc(l)); }
+    else if ((m = l.match(/^(>\s?)(.*)$/))) { cls = 'quote'; html = mk(esc(m[1])) + srcInline(m[2], project); }
+    else if ((m = l.match(/^(\s*)([-*+]|\d+[.)])(\s+)(.*)$/))) { cls = 'li'; html = `${m[1]}<span class="li-mk">${esc(m[2])}</span>${m[3]}${srcInline(m[4], project)}`; }
+    else if (/^\s*\|.*\|\s*$/.test(l)) { cls = 'table'; html = esc(l).replace(/\|/g, mk('|')); }
+    else html = srcInline(l, project);
+    return `<div class="ln ${cls}"><span class="no">${i + 1}</span><span class="tx">${html}</span></div>`;
+  }).join('');
+}
+function rawLines(raw) {
+  const lines = raw.replace(/\r\n/g, '\n').split('\n');
+  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+  return lines.map((l, i) => `<div class="ln"><span class="no">${i + 1}</span><span class="tx">${esc(l)}</span></div>`).join('');
+}
+const fmtBytes = b => b < 1024 ? `${b} B` : fmtKB(b);
+function fileCard(file, raw, path, project) {
+  const lines = raw.replace(/\n$/, '').split('\n').length, bytes = new Blob([raw]).size;
+  const mode = state.docMode;
+  return `<article class="file">
+    <div class="file-bar">
+      <span class="file-name" title="${esc(path)}">${esc(file)}</span>
+      <span class="file-meta">${fmtBytes(bytes)} · ${plural(lines, 'line', 'lines')}</span>
+      <button class="copy" data-copy="${esc(path)}">copy path</button>
+      <button class="icon-btn" data-copy="${esc(raw)}" title="Copy file contents">${ICONS.copy}</button>
+      <div class="seg" role="group" aria-label="View mode">${Object.entries(DOC_MODES).map(([k, l]) =>
+        `<button data-docmode="${k}" class="${mode === k ? 'on' : ''}">${l}</button>`).join('')}</div>
+    </div>
+    <div class="${mode === 'raw' ? 'raw' : 'doc'}">${mode === 'raw' ? rawLines(raw) : docLines(raw, project)}</div>
+  </article>`;
 }
 
 // ---------- Health checks ----------
@@ -220,6 +252,7 @@ function render() {
   if (tip) tip.style.display = 'none'; // the content under the cursor may have changed
   renderSidebar();
   if (state.view === 'memories') { renderChips(); renderList(); renderDetail(); }
+  else if (state.view === 'timeline') renderTimeline();
   else if (state.view === 'graph') renderGraph();
   else if (state.view === 'stats') renderStats();
   else renderHealth();
@@ -313,55 +346,44 @@ function renderList() {
   if (state.file && key !== lastListed) { $('#list .item.sel')?.scrollIntoView({ block: 'nearest' }); lastListed = key; }
 }
 
-function usageFacts(m) {
-  if (!usageReady()) return `<div class="usage muted">${usage.status === 'error' ? 'Usage not available' : 'Analysing usage…'}</div>`;
+function usageInline(m) {
+  if (!usageReady()) return `<span class="muted">${usage.status === 'error' ? 'usage not available' : 'analysing usage…'}</span>`;
   const u = usageOf(m);
-  const parts = [];
-  if (u.reads) {
-    parts.push(`<b>${plural(u.reads, 'read', 'reads')}</b> in ${plural(u.sessions, 'session', 'sessions')}` +
-      (m.session ? ` (${u.otherSessions} besides the one that created it)` : ''));
-    parts.push(`last read ${fmtDate(u.lastRead)}`);
-  } else {
-    parts.push('<b class="unread">Never read</b> in the analysed sessions');
-  }
-  if (u.writes) parts.push(`${plural(u.writes, 'write', 'writes')}, last on ${fmtDate(u.lastWrite)}`);
-  return `<div class="usage">${parts.join(' · ')}<div class="muted">Usage measured over ${windowText()}</div></div>`;
+  const tip = [u.reads ? `${plural(u.reads, 'read', 'reads')} in ${plural(u.sessions, 'session', 'sessions')}` : 'Never read',
+    u.reads && m.session ? `${u.otherSessions} besides the session that created it` : null,
+    u.reads ? `Last read ${fmtDate(u.lastRead)}` : null,
+    u.writes ? `${plural(u.writes, 'write', 'writes')}, last on ${fmtDate(u.lastWrite)}` : null,
+    `Measured over ${windowText()}`].filter(Boolean).join('\n');
+  const text = u.reads ? `${plural(u.reads, 'read', 'reads')} · ${plural(u.sessions, 'session', 'sessions')} · last ${fmtShort(u.lastRead)}` : 'never read';
+  return `<span class="usage-inline${u.reads ? '' : ' unread'}" data-tip="${esc(tip)}">${text}</span>`;
 }
 
 let lastShown = null;
 function renderDetail() {
   const proj = projectById(state.selProject);
-  if (!proj || !state.file) { $('#detail').innerHTML = '<div class="placeholder">Pick a memory<br><br><kbd>/</kbd> search · <kbd>↑</kbd><kbd>↓</kbd> move · <kbd>1</kbd>–<kbd>4</kbd> views</div>'; return; }
+  if (!proj || !state.file) { $('#detail').innerHTML = '<div class="placeholder">Pick a memory<br><br><kbd>/</kbd> search · <kbd>↑</kbd><kbd>↓</kbd> move · <kbd>1</kbd>–<kbd>5</kbd> views</div>'; return; }
+  const sep = '<span class="dot-sep">·</span>';
   let html;
   if (state.file === 'MEMORY.md' && proj.index) {
     const st = indexStatus(proj), L = data.indexLimits;
-    html = `<article>
-      <div class="head"><span class="tag index">Index</span><h2>MEMORY.md</h2>
-      <p class="desc">${esc(proj.path)}</p></div>
-      <div class="facts"><span>Modified ${fmtDate(proj.index.mtime)}</span>
-        <span>${fmtKB(proj.index.bytes)} of ${fmtKB(L.bytes)} · ${proj.index.lines} of ${L.lines} lines</span>
-        ${statusPill(st.level, st.label)}
-        <span><code>${esc(proj.memDir)}/MEMORY.md</code></span></div>
-      <div class="md">${markdown(proj.index.body, proj)}</div></article>`;
+    html = `<div class="doc-page">
+      <h2 class="doc-title">MEMORY.md</h2>
+      <div class="meta-line"><span class="tag index">Index</span>${sep}<span>${esc(projLabel(proj))}</span>${sep}
+        <span data-tip="${esc(`Loaded at the start of every session in this project\nOnly the first ${L.lines} lines or ${fmtKB(L.bytes)} are loaded`)}">${fmtKB(proj.index.bytes)} of ${fmtKB(L.bytes)} · ${proj.index.lines} of ${L.lines} lines</span>${sep}${statusPill(st.level, st.label)}</div>
+      ${fileCard('MEMORY.md', proj.index.body, proj.memDir + '/MEMORY.md', proj)}</div>`;
   } else {
     const m = proj.memories.find(x => x.file === state.file);
     if (!m) { $('#detail').innerHTML = '<div class="placeholder">Memory not found</div>'; return; }
     const mm = all.find(x => x.project === proj && x.file === m.file);
     const backlinks = proj.memories.filter(o => o !== m && (o.body.includes(`[[${m.name}]]`) || o.body.includes(`(${m.file})`)));
-    html = `<article>
-      <div class="head">${typeTag(m.type)}<h2>${esc(m.name)}</h2><p class="desc">${esc(m.description)}</p></div>
-      <div class="facts">
-        <span>Modified ${fmtDate(m.modified)}</span>
-        <span>${esc(proj.path)}</span>
-        <span><code>${esc(m.path)}</code> <button class="copy" data-copy="${esc(m.path)}">copy path</button></span>
-        ${m.session ? `<span>session <code>${esc(m.session.slice(0, 8))}</code></span>` : ''}
-        <a class="facts-link" href="${hrefFor('graph', state.project)}" data-graph-sel="${esc(proj.id + '/' + m.file)}">View in graph →</a>
-      </div>
-      ${usageFacts(mm)}
-      <div class="md">${markdown(m.body, proj)}</div>
+    html = `<div class="doc-page">
+      <h2 class="doc-title">${esc(m.name)}</h2>
+      <div class="meta-line">${typeTag(m.type)}${sep}<span title="${esc(proj.path)}">${esc(projLabel(proj))}</span>${sep}${usageInline(mm)}${sep}
+        <a class="facts-link" href="${hrefFor('graph', state.project)}" data-graph-sel="${esc(proj.id + '/' + m.file)}">View in graph →</a></div>
+      ${fileCard(m.file, m.raw, m.path, proj)}
       ${backlinks.length ? `<div class="backlinks"><h4>Linked from</h4>${backlinks.map(b =>
         `<a href="${memHref(proj.id, b.file)}">${esc(b.name)}</a>`).join('')}</div>` : ''}
-    </article>`;
+    </div>`;
   }
   $('#detail').innerHTML = html;
   const key = proj.id + '/' + state.file;
@@ -535,17 +557,149 @@ function renderHealth() {
   // Empty folders
   if (state.project === '*') {
     html += `<section class="hsec" id="s-empty"><h3>Empty memory folders <span class="count">${h.empty.length}</span></h3>
-      <p class="muted">Projects with a <code>memory/</code> folder but no memories. They do no harm and can be deleted safely.</p>
-      ${h.empty.length ? `<table class="htable"><tr><th>Project</th><th>Folder</th></tr>
-        ${h.empty.map(e => `<tr><td>${esc(e.path)}${e.exists ? '' : ' <span class="muted">· no longer exists</span>'}</td><td><code>${esc(e.memDir)}</code></td></tr>`).join('')}
+      <p class="muted">Projects with a <code>memory/</code> folder but no memories. Claude Code creates the folder when a session starts; it stays empty until Claude decides something is worth remembering. Sessions counts every session (including worktrees of the same repo) that was given this folder.</p>
+      ${h.empty.length ? `<table class="htable"><tr><th>Project</th><th>Sessions</th><th>Folder</th></tr>
+        ${[...h.empty].sort((a, b) => emptySessions(b) - emptySessions(a)).map(e => `<tr><td>${esc(e.path)}${e.exists ? '' : ' <span class="muted">· no longer exists</span>'}</td>
+          <td class="nowrap">${!usageReady() ? '…' : emptySessions(e) ? `${plural(emptySessions(e), 'session', 'sessions')}, nothing saved` : '<span class="muted">none analysed</span>'}</td>
+          <td><code>${esc(e.memDir)}</code></td></tr>`).join('')}
       </table>` : '<p>None.</p>'}</section>`;
   }
   html += '</div>';
   $('#detail').innerHTML = html;
 }
+const emptySessions = e => usage.data?.projects[e.id]?.sessions || 0;
 function meter(ratio, label) {
   const level = ratio >= 1 ? 'critical' : ratio >= LIMIT_WARN ? 'warning' : 'good';
   return `<div class="meter ${level}" title="${Math.round(ratio * 100)}%"><span style="width:${Math.min(100, ratio * 100)}%"></span></div><div class="small">${label}</div>`;
+}
+
+// ----- Timeline view -----
+// Every known event, newest first, grouped by day: reads and writes found in transcripts (grouped
+// by session), plus creations/edits taken from file dates when no transcript recorded them.
+const TL_KINDS = { created: 'Created', edited: 'Edited', read: 'Read' };
+const pad2 = n => String(n).padStart(2, '0');
+const dayKey = ts => { const d = new Date(ts); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; };
+const shortCwd = cwd => {
+  if (!cwd) return 'unknown folder';
+  const parts = cwd.replace(/^\/(Users|home)\/[^/]+/, '~').split('/');
+  return parts.length > 3 ? '…/' + parts.slice(-2).join('/') : parts.join('/');
+};
+
+function timelineItems(mems) {
+  const byKey = new Map(mems.map(m => [`${m.project.id}/${m.file}`, m]));
+  const projectIds = new Set(mems.map(m => m.project.id));
+  const U = usage.data;
+  const events = (U?.timeline || []).filter(e => projectIds.has(e[2]));
+  const writesOf = new Map();
+  for (const e of events) if (e[1] === 'write') (writesOf.get(`${e[2]}/${e[3]}`) || writesOf.set(`${e[2]}/${e[3]}`, []).get(`${e[2]}/${e[3]}`)).push(Date.parse(e[0]));
+  const near = (key, ts, ms = 5 * 60000) => (writesOf.get(key) || []).some(t => Math.abs(t - ts) < ms);
+
+  // transcript events → per (day, session) groups
+  const groups = new Map();
+  for (const [ts, kind, mp, file, sid] of events) {
+    const key = `${mp}/${file}`, m = byKey.get(key);
+    const created = m ? Date.parse(m.created) : NaN;
+    const k = kind === 'read' ? 'read' : (Math.abs(Date.parse(ts) - created) < 5 * 60000 ? 'created' : 'edited');
+    const gk = dayKey(ts) + '|' + sid;
+    const g = groups.get(gk) || { type: 'session', day: dayKey(ts), sid, first: ts, last: ts, rows: new Map() };
+    if (ts < g.first) g.first = ts;
+    if (ts > g.last) g.last = ts;
+    const rk = k + '|' + key; // collapse repeated reads/edits of the same memory in a session
+    const row = g.rows.get(rk) || { kind: k, key, m, file, mp, ts, n: 0 };
+    row.n++; if (ts > row.ts) row.ts = ts;
+    g.rows.set(rk, row);
+    groups.set(gk, g);
+  }
+  const items = [...groups.values()].map(g => ({ ...g, ts: g.last, rows: [...g.rows.values()].sort((a, b) => b.ts.localeCompare(a.ts)) }));
+
+  // file dates, when no transcript write explains them
+  for (const m of mems) {
+    const key = `${m.project.id}/${m.file}`, c = Date.parse(m.created), mo = Date.parse(m.modified);
+    if (!isNaN(c) && !near(key, c)) items.push({ type: 'file', kind: 'created', ts: m.created, day: dayKey(m.created), m, key });
+    if (!isNaN(mo) && mo - c > 3600000 && !near(key, mo)) items.push({ type: 'file', kind: 'edited', ts: new Date(mo).toISOString(), day: dayKey(mo), m, key });
+  }
+  return items.sort((a, b) => b.ts.localeCompare(a.ts));
+}
+
+function heatmap(items) {
+  // count events per day (a session group counts each of its rows)
+  const perDay = new Map();
+  for (const it of items) {
+    const c = perDay.get(it.day) || { created: 0, edited: 0, read: 0 };
+    if (it.type === 'file') c[it.kind]++; else for (const r of it.rows) c[r.kind] += r.n;
+    perDay.set(it.day, c);
+  }
+  if (!perDay.size) return '';
+  const total = c => c.created + c.edited + c.read;
+  const max = Math.max(...[...perDay.values()].map(total));
+  const first = new Date([...perDay.keys()].sort()[0] + 'T12:00:00');
+  first.setDate(first.getDate() - ((first.getDay() + 6) % 7)); // back to Monday
+  const today = new Date(); today.setHours(12, 0, 0, 0);
+  let cols = '', months = '', week = 0, lastMonth = -1;
+  for (const d = new Date(first); d <= today; d.setDate(d.getDate() + 7), week++) {
+    if (d.getMonth() !== lastMonth) { months += `<span style="grid-column:${week + 1}">${d.toLocaleDateString(LOCALE, { month: 'short' })}</span>`; lastMonth = d.getMonth(); }
+    let cells = '';
+    for (let i = 0; i < 7; i++) {
+      const day = new Date(d); day.setDate(d.getDate() + i);
+      const k = dayKey(day), c = perDay.get(k), n = c ? total(c) : 0;
+      const lvl = !n ? 0 : Math.min(4, Math.ceil(Math.sqrt(n / max) * 4));
+      cells += day > today ? '<i class="hm-out"></i>' : `<i class="hm-${lvl}"${n ? ` data-day="${k}"` : ''} data-tip="${esc(fmtDate(day) + (c ? `\n${c.created} created · ${c.edited} edited · ${c.read} reads` : '\nNo activity'))}"></i>`;
+    }
+    cols += `<div class="hm-col">${cells}</div>`;
+  }
+  return `<div class="heatmap">
+    <div class="hm-months" style="grid-template-columns:repeat(${week},14px)">${months}</div>
+    <div class="hm-body"><div class="hm-days"><span>Mon</span><span></span><span>Wed</span><span></span><span>Fri</span><span></span><span></span></div><div class="hm-grid">${cols}</div></div>
+    <div class="hm-legend">Less <i class="hm-0"></i><i class="hm-1"></i><i class="hm-2"></i><i class="hm-3"></i><i class="hm-4"></i> More</div>
+  </div>`;
+}
+
+function renderTimeline() {
+  const mems = scoped(), proj = projectById(state.project), U = usage.data;
+  const allItems = timelineItems(mems);
+  const on = state.tlKinds;
+  const items = allItems.map(it => it.type === 'file' ? (on.has(it.kind) ? it : null)
+    : (() => { const rows = it.rows.filter(r => on.has(r.kind)); return rows.length ? { ...it, rows } : null; })()).filter(Boolean);
+  const count = k => allItems.reduce((a, it) => a + (it.type === 'file' ? +(it.kind === k) : it.rows.filter(r => r.kind === k).reduce((x, r) => x + r.n, 0)), 0);
+  const memLink = (m, key) => m ? `<a class="tl-mem" href="${memHref(m.project.id, m.file)}"><i style="background:${typeColor(m.type)}"></i>${esc(m.name)}</a>`
+    : `<span class="tl-mem gone"><i></i>${esc(key.split('/').pop())}<small>deleted</small></span>`;
+  const kindBadge = k => `<span class="tl-kind ${k}">${TL_KINDS[k]}</span>`;
+  const time = ts => new Date(ts).toLocaleTimeString(LOCALE, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+
+  let html = '', lastDay = null;
+  for (const it of items) {
+    if (it.day !== lastDay) {
+      const dayItems = items.filter(x => x.day === it.day);
+      const sessions = dayItems.filter(x => x.type === 'session').length;
+      const n = k => dayItems.reduce((a, x) => a + (x.type === 'file' ? +(x.kind === k) : x.rows.filter(r => r.kind === k).reduce((s, r) => s + r.n, 0)), 0);
+      const sum = [n('created') && `${n('created')} created`, n('edited') && `${n('edited')} edited`, n('read') && plural(n('read'), 'read', 'reads'), sessions && plural(sessions, 'session', 'sessions')].filter(Boolean).join(' · ');
+      html += `${lastDay ? '</div>' : ''}<div class="tl-day" id="day-${it.day}"><div class="tl-date"><b>${new Date(it.day + 'T12:00:00').toLocaleDateString(LOCALE, { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' })}</b><span>${sum}</span></div>`;
+      lastDay = it.day;
+    }
+    if (it.type === 'file') {
+      html += `<div class="tl-item tl-file"><span class="tl-time">${time(it.ts)}</span><span class="tl-dot ${it.kind}"></span>
+        <div class="tl-body">${kindBadge(it.kind)} ${memLink(it.m, it.key)}${proj ? '' : `<span class="tl-proj">${esc(projLabel(it.m.project))}</span>`}
+        <span class="tl-src" data-tip="${esc('From the file dates: no analysed transcript recorded this change')}">file date</span></div></div>`;
+    } else {
+      const info = U?.sessions?.[it.sid] || {};
+      html += `<div class="tl-item tl-session"><span class="tl-time">${time(it.last)}</span><span class="tl-dot session"></span>
+        <div class="tl-body"><div class="tl-shead">${ICONS.terminal}<span data-tip="${esc(`Session ${it.sid}\n${info.cwd || ''}`)}">${esc(shortCwd(info.cwd))}</span>
+          <code>${esc(it.sid.slice(0, 8))}</code><span class="muted">${time(it.first) === time(it.last) ? '' : `${time(it.first)}–${time(it.last)}`}</span></div>
+          <div class="tl-rows">${it.rows.map(r => `<div class="tl-row">${kindBadge(r.kind)} ${memLink(r.m, r.key)}${r.n > 1 ? `<span class="tl-n">×${r.n}</span>` : ''}${proj || !r.m ? '' : `<span class="tl-proj">${esc(projLabel(r.m.project))}</span>`}</div>`).join('')}</div>
+        </div></div>`;
+    }
+  }
+  if (lastDay) html += '</div>';
+
+  $('#detail').innerHTML = `<div class="page page-timeline">
+    <header class="page-head"><h2>Timeline</h2><p>${esc(proj ? projLabel(proj) : 'all projects')} · every memory event, newest first</p></header>
+    ${heatmap(allItems)}
+    <div class="tl-bar">
+      ${Object.entries(TL_KINDS).map(([k, l]) => `<button class="chip tl-chip ${on.has(k) ? 'on' : ''}" data-tlkind="${k}"><span class="tl-dot ${k}"></span>${l} ${count(k)}</button>`).join('')}
+      <span class="muted small">${U ? `Reads and session details come from ${windowText()}; older creations and edits come from file dates.` : 'Scanning transcripts… reads will appear when it finishes.'}</span>
+    </div>
+    <div class="timeline">${html || '<div class="empty">Nothing to show</div>'}</div>
+  </div>`;
 }
 
 // ----- Graph view -----
@@ -837,9 +991,16 @@ $('aside').addEventListener('click', e => { if (e.target.closest('#refresh')) re
 $('#detail').addEventListener('click', e => {
   const c = e.target.closest('[data-copy]');
   if (c) {
-    navigator.clipboard.writeText(c.dataset.copy); c.textContent = 'copied ✓';
-    setTimeout(() => c.textContent = 'copy path', 1200);
+    navigator.clipboard.writeText(c.dataset.copy);
+    if (c.classList.contains('icon-btn')) { const prev = c.innerHTML; c.innerHTML = ICONS.check; setTimeout(() => c.innerHTML = prev, 1200); }
+    else { c.textContent = 'copied ✓'; setTimeout(() => c.textContent = 'copy path', 1200); }
   }
+  const tk = e.target.closest('[data-tlkind]');
+  if (tk) { const k = tk.dataset.tlkind; state.tlKinds.has(k) ? state.tlKinds.delete(k) : state.tlKinds.add(k); return renderTimeline(); }
+  const hd = e.target.closest('[data-day]');
+  if (hd) { const el = document.getElementById('day-' + hd.dataset.day); if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'start' }); el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 1200); } return; }
+  const dm = e.target.closest('[data-docmode]');
+  if (dm) { state.docMode = dm.dataset.docmode; localStorage.setItem('memx.docMode', state.docMode); return renderDetail(); }
   const gs = e.target.closest('[data-graph-sel]');
   if (gs) { state.graphPin = { node: gs.dataset.graphSel }; state.graphFit = true; } // the link then navigates to the graph
   const a = e.target.closest('[data-anchor]');
@@ -887,7 +1048,7 @@ $('#detail').addEventListener('mouseover', e => {
 
 document.addEventListener('keydown', e => {
   const typing = /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement?.tagName);
-  if (!typing && !e.metaKey && !e.ctrlKey && !e.altKey && /^[1-4]$/.test(e.key)) {
+  if (!typing && !e.metaKey && !e.ctrlKey && !e.altKey && /^[1-5]$/.test(e.key)) {
     location.hash = hrefFor(Object.keys(VIEWS)[+e.key - 1], state.project);
     return;
   }

@@ -5,6 +5,7 @@
 //   load  → MEMORY.md is loaded at session start (or after compaction) ("AutoMem" attachment)
 //   read  → Read, a "file" attachment, or cat/head/grep via Bash on a memory file
 //   write → Write/Edit, or a redirect/sed -i via Bash on a memory file
+//   dir   → the memory folder the session was given in its system prompt (even if it is empty)
 //
 // The cache stores each transcript's events and only re-reads the ones that changed
 // (mtime/size). Transcripts Claude Code deletes (cleanupPeriodDays) are kept in the cache,
@@ -14,7 +15,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 
-const CACHE_VERSION = 1;
+const CACHE_VERSION = 2;
 const NEEDLE = Buffer.from('/memory/');
 const MEMRE = /\/projects\/(-[^/\s"'`\\]+)\/memory\/([\w.\-]+\.md)/g;
 const RESCAN_AFTER_MS = 20_000;
@@ -85,6 +86,12 @@ function loadCache(file) {
   try {
     const c = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (c.version === CACHE_VERSION) return c;
+    // Older cache: re-parse transcripts still on disk, but keep the events of deleted ones
+    // (they cannot be re-read and are the only record of that usage).
+    if (c.version < CACHE_VERSION && c.files) {
+      for (const entry of Object.values(c.files)) if (!entry.deleted) entry.mtime = -1;
+      return { version: CACHE_VERSION, files: c.files };
+    }
   } catch {}
   return { version: CACHE_VERSION, files: {} };
 }
@@ -122,6 +129,9 @@ async function parseFile(full) {
       lastStart = start;
       const line = buf.toString('utf8', start, end);
       // Only attachments and tool calls matter; avoids parsing huge dumps.
+      // The system prompt names the session's memory folder; read it without parsing the (huge) line
+      const dir = line.match(/file-based memory at `?[^`\s"]*\/projects\/(-[^/`\s"\\]+)\/memory/);
+      if (dir && !ev.some(e => e[0] === 'dir' && e[2] === dir[1])) ev.push(['dir', line.match(/"timestamp":"([^"]+)"/)?.[1] || null, dir[1]]);
       if (line.includes('"AutoMem"') || line.includes('"tool_use"') || line.includes('"type":"file"')) {
         try { extract(JSON.parse(line), ev); } catch {}
       }
@@ -181,13 +191,15 @@ function weekOf(ts) {
 }
 
 function aggregate(cache) {
+  const timeline = [];          // [ts, 'read'|'write', mp, file, sid], every individual event
+  const sessionInfo = new Map(); // sid → { cwd, first, last }
   const memories = {};   // "mp/file" → usage
   const projects = {};   // mp → index loads, sessions…
   const weeks = {};      // Monday → activity
   const sessions = new Map(); // sid → { first, mps:Set (indexes loaded), reads:Set (mps read) }
   let from = null, to = null, deletedFiles = 0, files = 0;
 
-  const proj = mp => projects[mp] ||= { loads: 0, loadSessions: new Set(), readSessions: new Set(), index: {} };
+  const proj = mp => projects[mp] ||= { loads: 0, loadSessions: new Set(), readSessions: new Set(), dirSessions: new Set(), index: {} };
   const week = w => weeks[w] ||= { sessions: new Set(), by: {} };
   const wp = (w, mp) => (week(w).by[mp] ||= { reads: 0, writes: 0, loads: 0, loaded: 0, read: 0 });
 
@@ -200,8 +212,16 @@ function aggregate(cache) {
     if (f.first && (!s.first || f.first < s.first)) s.first = f.first;
     sessions.set(f.sid, s);
 
+    // session info for the timeline: the main transcript's cwd wins over subagents'
+    const info = sessionInfo.get(f.sid) || {};
+    if (f.cwd && (!info.cwd || !f.side)) info.cwd = f.cwd;
+    if (f.first && (!info.first || f.first < info.first)) info.first = f.first;
+    if (f.last && (!info.last || f.last > info.last)) info.last = f.last;
+    sessionInfo.set(f.sid, info);
     for (const [kind, ts, mp, file, len] of f.ev) {
+      if ((kind === 'read' || kind === 'write') && file !== 'MEMORY.md') timeline.push([ts, kind, mp, file, f.sid]);
       const w = weekOf(ts);
+      if (kind === 'dir') { proj(mp).dirSessions.add(f.sid); continue; }
       if (kind === 'load') {
         const p = proj(mp);
         p.loads++; p.loadSessions.add(f.sid); s.mps.add(mp);
@@ -244,9 +264,12 @@ function aggregate(cache) {
     projects: Object.fromEntries(Object.entries(projects).map(([mp, p]) => [mp, {
       loads: p.loads,
       loadSessions: p.loadSessions.size,
+      sessions: p.dirSessions.size, // sessions that were given this memory folder
       readSessions: [...p.readSessions].filter(s => p.loadSessions.has(s)).length,
       index: Object.entries(p.index).sort(([a], [b]) => a.localeCompare(b)),
     }])),
     weekly,
+    timeline: timeline.filter(e => e[0]).sort((a, b) => a[0].localeCompare(b[0])),
+    sessions: Object.fromEntries([...new Set(timeline.map(e => e[4]))].map(sid => [sid, sessionInfo.get(sid) || {}])),
   };
 }

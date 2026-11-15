@@ -170,13 +170,13 @@ function louvain(n, edges) {
   return members.sort((a, b) => b.length - a.length);
 }
 
-// Soft hull around a set of circles: convex hull of points sampled around each node, drawn as a
-// smooth closed curve (Catmull-Rom → Bézier).
+// Soft hull around a set of circles: convex hull of points sampled densely around each node.
+// The sampling already rounds the corners, so straight segments are enough (and never overshoot).
 export function hullPath(points, pad = 22) {
   const pts = [];
   for (const p of points) {
     const r = pad + (p.r || 0);
-    for (let a = 0; a < 16; a++) pts.push([p.x + r * Math.cos((a / 16) * Math.PI * 2), p.y + r * Math.sin((a / 16) * Math.PI * 2)]);
+    for (let a = 0; a < 32; a++) pts.push([p.x + r * Math.cos((a / 32) * Math.PI * 2), p.y + r * Math.sin((a / 32) * Math.PI * 2)]);
   }
   pts.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
   const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
@@ -185,15 +185,7 @@ export function hullPath(points, pad = 22) {
   for (let i = pts.length - 1; i >= 0; i--) { const p = pts[i]; while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop(); upper.push(p); }
   const h = lower.slice(0, -1).concat(upper.slice(0, -1));
   if (h.length < 3) return '';
-  const n = h.length, P = i => h[(i + n) % n];
-  let d = `M${P(0)[0].toFixed(1)},${P(0)[1].toFixed(1)}`;
-  for (let i = 0; i < n; i++) {
-    const p0 = P(i - 1), p1 = P(i), p2 = P(i + 1), p3 = P(i + 2);
-    const c1 = [p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6];
-    const c2 = [p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6];
-    d += `C${c1[0].toFixed(1)},${c1[1].toFixed(1)} ${c2[0].toFixed(1)},${c2[1].toFixed(1)} ${p2[0].toFixed(1)},${p2[1].toFixed(1)}`;
-  }
-  return d + 'Z';
+  return 'M' + h.map(p => `${p[0].toFixed(1)},${p[1].toFixed(1)}`).join('L') + 'Z';
 }
 
 // Wheel zoom and background drag, by changing the SVG viewBox

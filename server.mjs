@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Local, read-only browser for Claude Code's memories.
-// Usage: node server.mjs [--port 4321] [--no-open]
+// Usage: node server.mjs [--port 4321] [--no-open] [--demo]
 
 import http from 'node:http';
 import fs from 'node:fs';
@@ -8,7 +8,9 @@ import path from 'node:path';
 import os from 'node:os';
 import { exec } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 import { createUsageIndex } from './usage.mjs';
+import { makeDemo } from './demo.mjs';
 
 const args = process.argv.slice(2);
 const argVal = (flag, def) => {
@@ -17,10 +19,17 @@ const argVal = (flag, def) => {
 };
 const PORT = Number(argVal('--port', process.env.PORT || 4321));
 const OPEN = !args.includes('--no-open');
-const CLAUDE_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+const DEMO = args.includes('--demo');
+const DEFAULT_DIR = path.join(os.homedir(), '.claude');
+const CLAUDE_DIR = DEMO ? makeDemo() : process.env.CLAUDE_CONFIG_DIR || DEFAULT_DIR;
 const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const CACHE_FILE = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'memory-explorer', 'usage.json');
+// One cache per data folder, so the demo (or another CLAUDE_CONFIG_DIR) never mixes with yours
+const CACHE_NAME = CLAUDE_DIR === DEFAULT_DIR ? 'usage.json' : `usage-${createHash('sha1').update(CLAUDE_DIR).digest('hex').slice(0, 10)}.json`;
+const CACHE_FILE = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'memory-explorer', CACHE_NAME);
+// Optional folder → path map (used by the demo, whose project paths do not exist on disk)
+let PATH_MAP = {};
+try { PATH_MAP = JSON.parse(fs.readFileSync(path.join(CLAUDE_DIR, 'paths.json'), 'utf8')); } catch {}
 const usage = createUsageIndex({ projectsDir: PROJECTS_DIR, cacheFile: CACHE_FILE });
 
 // --- Frontmatter: minimal YAML subset (key: value, one level of nesting) ---
@@ -56,6 +65,7 @@ function unquote(v) {
 const pathCache = new Map();
 function resolveProjectPath(dirName) {
   if (pathCache.has(dirName)) return pathCache.get(dirName);
+  if (PATH_MAP[dirName]) return { path: PATH_MAP[dirName], exists: true };
   const parts = dirName.replace(/^-/, '').split('-');
   let found = null;
   const walk = (base, i) => {
@@ -80,6 +90,7 @@ function resolveProjectPath(dirName) {
 }
 
 function shortPath(p) {
+  if (DEMO && p.startsWith(CLAUDE_DIR)) return '~/.claude' + p.slice(CLAUDE_DIR.length);
   const home = os.homedir();
   return p.startsWith(home) ? '~' + p.slice(home.length) : p;
 }
@@ -128,6 +139,7 @@ function loadAll() {
         created: (stat.birthtime.getTime() ? stat.birthtime : stat.mtime).toISOString(),
         session: md.originSessionId || null,
         body: body.trim(),
+        raw, // the whole file, exactly as on disk
       });
     }
     project.memories.sort((a, b) => b.modified.localeCompare(a.modified));
@@ -150,7 +162,7 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
     return res.end(JSON.stringify(usage.get()));
   }
-  const STATIC = { '/': ['index.html', 'text/html'], '/index.html': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/charts.js': ['charts.js', 'text/javascript'], '/graph.js': ['graph.js', 'text/javascript'] };
+  const STATIC = { '/': ['index.html', 'text/html'], '/index.html': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/charts.js': ['charts.js', 'text/javascript'], '/graph.js': ['graph.js', 'text/javascript'], '/logo.svg': ['logo.svg', 'image/svg+xml'] };
   const file = STATIC[url.pathname];
   if (file) {
     res.writeHead(200, { 'Content-Type': `${file[1]}; charset=utf-8`, 'Cache-Control': 'no-store' });
@@ -167,7 +179,7 @@ server.on('error', e => {
 
 server.listen(PORT, '127.0.0.1', () => {
   const url = `http://localhost:${PORT}`;
-  console.log(`Memory Explorer → ${url}  (reading ${PROJECTS_DIR})`);
+  console.log(`Memory Explorer → ${url}  (${DEMO ? 'demo data' : 'reading ' + PROJECTS_DIR})`);
   usage.refresh(); // first usage scan, in the background
   if (OPEN) {
     const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start ""' : 'xdg-open';
