@@ -19,13 +19,58 @@ A local, read-only web UI to browse what Claude Code keeps in its memory (`~/.cl
 
 <sub>Screenshots use the bundled demo data, not real memories.</sub>
 
+## Getting started
+
+### Requirements
+
+- **Node.js 20 or newer** (`node -v` to check). Nothing else: no `npm install`, no dependencies.
+- **Claude Code**, used at least once, so that `~/.claude/projects/` exists. Memories only show up once Claude has saved some; usage needs session transcripts.
+- macOS or Linux. Windows is untested.
+
+### Install and run
+
 ```sh
-node server.mjs            # opens http://localhost:4321 in your browser
-node server.mjs --port 5000 --no-open
-node server.mjs --demo     # try it with made-up projects, memories and sessions
+git clone https://github.com/furilo/claude-memory-explorer.git
+cd claude-memory-explorer
+node server.mjs
 ```
 
-No dependencies (Node ≥ 20). The server only listens on `127.0.0.1` and never modifies anything under `~/.claude`. It honours `CLAUDE_CONFIG_DIR` if you have it set.
+That's it: the server starts and your browser opens **http://localhost:4321**. Leave the terminal open while you use it, and press `Ctrl+C` to stop it.
+
+The first time, the sidebar shows *Scanning transcripts…* for a few seconds while it reads your session history; memories are browsable right away, and usage numbers appear when the scan finishes. Later starts are almost instant thanks to the cache.
+
+No memories of your own yet? Try it with made-up data:
+
+```sh
+node server.mjs --demo
+```
+
+### Options
+
+| Option | What it does |
+|---|---|
+| `--port 5000` | Use another port (default `4321`) |
+| `--no-open` | Don't open the browser automatically |
+| `--demo` | Use generated demo data instead of `~/.claude` |
+| `CLAUDE_CONFIG_DIR=/path node server.mjs` | Read another Claude config folder (also honoured if already set in your shell) |
+
+### Update and uninstall
+
+```sh
+git pull                              # update, from the claude-memory-explorer folder
+rm -rf claude-memory-explorer         # uninstall: delete the folder…
+rm -rf ~/.cache/memory-explorer       # …and the usage cache
+```
+
+### Privacy
+
+Everything runs on your machine. The server only listens on `127.0.0.1`, never modifies anything under `~/.claude`, and sends nothing anywhere. The only thing it writes is its usage cache in `~/.cache/memory-explorer/` (plus, with `--demo`, the sample data in a temporary folder).
+
+### Troubleshooting
+
+- **`Port 4321 is in use`** — another copy is probably running; open http://localhost:4321, or start this one with `--port 4322`.
+- **No projects in the sidebar** — Claude hasn't saved any memory yet (only projects with memories are listed; empty memory folders appear under *Health*). Check `ls ~/.claude/projects/*/memory/`.
+- **Usage numbers look low** — Claude Code deletes transcripts older than `cleanupPeriodDays` (30 days by default), so usage only covers recent sessions at first. The cache keeps what it has seen from then on; to keep more history in Claude Code itself, raise `cleanupPeriodDays` in `~/.claude/settings.json`.
 
 ## Views
 
