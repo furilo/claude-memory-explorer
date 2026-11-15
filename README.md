@@ -66,3 +66,7 @@ Results are cached in `~/.cache/memory-explorer/usage.json` (or `$XDG_CACHE_HOME
 - `graph.js` — force layout, groups, hulls and pan/zoom for the graph
 - `demo.mjs` — demo data generator (`--demo`)
 - `logo.svg` — logo and favicon
+
+## License
+
+[MIT](LICENSE)

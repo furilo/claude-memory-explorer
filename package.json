@@ -2,6 +2,7 @@
   "name": "claude-memory-explorer",
   "version": "0.1.0",
   "description": "Local, read-only web UI to browse Claude Code's memories: usage, link graph and health",
+  "license": "MIT",
   "type": "module",
   "bin": {
     "claude-memory-explorer": "server.mjs"
