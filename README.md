@@ -39,7 +39,7 @@ Switch views from the sidebar or with the keys `1`–`5`. Every view can be filt
 
 ## Demo data
 
-`--demo` generates a fake `~/.claude` in a temporary folder (`demo.mjs`): three projects with 29 memories, links between them, an empty memory folder and ~65 sessions across the main repo and several worktrees, with dates relative to today. It has its own usage cache, so it never mixes with your real data.
+`--demo` generates a fake `~/.claude` in a temporary folder (`demo.mjs`): three projects with 29 memories, links between them, an empty memory folder and ~65 sessions across the main repo and several worktrees, with dates relative to today. Its usage cache lives inside that temporary folder and is rebuilt on every run, so it never mixes with your real data.
 
 ## Where usage data comes from
 
@@ -54,7 +54,7 @@ Memory folders are per repository: sessions in git worktrees (Conductor, Paseo, 
 
 There is no way to tell whether Claude used an index line without opening the memory; only explicit reads count.
 
-Results are cached in `~/.cache/memory-explorer/usage.json` (or `$XDG_CACHE_HOME`; any other `CLAUDE_CONFIG_DIR` or the demo get a cache file of their own). The first scan takes a few seconds; after that only changed transcripts are re-read (around 100 ms). Claude Code deletes old transcripts (`cleanupPeriodDays`), but the cache keeps what it already analysed, so usage history keeps growing even after transcripts are gone. Delete that file to start over.
+Results are cached in `~/.cache/memory-explorer/usage.json` (or `$XDG_CACHE_HOME`; any other `CLAUDE_CONFIG_DIR` gets a cache file of its own, seeded on first run with its entries from `usage.json`). The first scan takes a few seconds; after that only changed transcripts are re-read (around 100 ms). Claude Code deletes old transcripts (`cleanupPeriodDays`), but the cache keeps what it already analysed, so usage history keeps growing even after transcripts are gone. Delete that file to start over.
 
 ## Files
 

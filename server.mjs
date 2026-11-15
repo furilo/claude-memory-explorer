@@ -21,16 +21,21 @@ const PORT = Number(argVal('--port', process.env.PORT || 4321));
 const OPEN = !args.includes('--no-open');
 const DEMO = args.includes('--demo');
 const DEFAULT_DIR = path.join(os.homedir(), '.claude');
-const CLAUDE_DIR = DEMO ? makeDemo() : process.env.CLAUDE_CONFIG_DIR || DEFAULT_DIR;
+const CLAUDE_DIR = DEMO ? makeDemo() : path.resolve(process.env.CLAUDE_CONFIG_DIR || DEFAULT_DIR);
 const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-// One cache per data folder, so the demo (or another CLAUDE_CONFIG_DIR) never mixes with yours
-const CACHE_NAME = CLAUDE_DIR === DEFAULT_DIR ? 'usage.json' : `usage-${createHash('sha1').update(CLAUDE_DIR).digest('hex').slice(0, 10)}.json`;
-const CACHE_FILE = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'memory-explorer', CACHE_NAME);
+// One cache per data folder, so another CLAUDE_CONFIG_DIR never mixes with yours. The demo is
+// rebuilt on every run, so its cache lives inside it and goes away with it.
+const real = p => { try { return fs.realpathSync(p); } catch { return path.resolve(p); } };
+const CACHE_DIR = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'memory-explorer');
+const LEGACY_CACHE = path.join(CACHE_DIR, 'usage.json'); // older versions used it for any folder
+const CACHE_FILE = DEMO ? path.join(CLAUDE_DIR, 'usage-cache.json')
+  : real(CLAUDE_DIR) === real(DEFAULT_DIR) ? LEGACY_CACHE
+  : path.join(CACHE_DIR, `usage-${createHash('sha1').update(real(CLAUDE_DIR)).digest('hex').slice(0, 10)}.json`);
 // Optional folder → path map (used by the demo, whose project paths do not exist on disk)
 let PATH_MAP = {};
 try { PATH_MAP = JSON.parse(fs.readFileSync(path.join(CLAUDE_DIR, 'paths.json'), 'utf8')); } catch {}
-const usage = createUsageIndex({ projectsDir: PROJECTS_DIR, cacheFile: CACHE_FILE });
+const usage = createUsageIndex({ projectsDir: PROJECTS_DIR, cacheFile: CACHE_FILE, legacyCacheFile: DEMO || CACHE_FILE === LEGACY_CACHE ? null : LEGACY_CACHE });
 
 // --- Frontmatter: minimal YAML subset (key: value, one level of nesting) ---
 function parseFrontmatter(text) {
@@ -95,6 +100,8 @@ function shortPath(p) {
   return p.startsWith(home) ? '~' + p.slice(home.length) : p;
 }
 
+const birthOk = st => st.birthtimeMs > 0 && st.birthtimeMs <= st.mtimeMs + 1000;
+
 // --- Read every memory ---
 function loadAll() {
   const projects = [];
@@ -127,7 +134,7 @@ function loadAll() {
         project.index = { body: raw, mtime: stat.mtime.toISOString(), bytes: Buffer.byteLength(raw), lines: raw.split('\n').filter((l, i, a) => i < a.length - 1 || l).length };
         continue;
       }
-      const { meta, body } = parseFrontmatter(raw);
+      const { meta } = parseFrontmatter(raw);
       const md = typeof meta.metadata === 'object' ? meta.metadata : {};
       project.memories.push({
         file: f,
@@ -136,10 +143,12 @@ function loadAll() {
         description: meta.description || '',
         type: md.type || meta.type || 'untyped',
         modified: md.modified || stat.mtime.toISOString(),
-        created: (stat.birthtime.getTime() ? stat.birthtime : stat.mtime).toISOString(),
+        // Birth time is missing on some filesystems, and can't be moved back in time on Linux
+        // (so it ends up after the mtime): then fall back to the mtime and say it is a guess
+        created: (birthOk(stat) ? stat.birthtime : stat.mtime).toISOString(),
+        createdExact: birthOk(stat),
         session: md.originSessionId || null,
-        body: body.trim(),
-        raw, // the whole file, exactly as on disk
+        raw, // the whole file, exactly as on disk (the client strips the frontmatter itself)
       });
     }
     project.memories.sort((a, b) => b.modified.localeCompare(a.modified));
@@ -161,6 +170,10 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/api/usage') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
     return res.end(JSON.stringify(usage.get()));
+  }
+  if (url.pathname === '/api/timeline') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify(usage.timeline()));
   }
   const STATIC = { '/': ['index.html', 'text/html'], '/index.html': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/charts.js': ['charts.js', 'text/javascript'], '/graph.js': ['graph.js', 'text/javascript'], '/logo.svg': ['logo.svg', 'image/svg+xml'] };
   const file = STATIC[url.pathname];

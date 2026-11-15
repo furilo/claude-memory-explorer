@@ -4,7 +4,8 @@
 // Signals extracted:
 //   load  → MEMORY.md is loaded at session start (or after compaction) ("AutoMem" attachment)
 //   read  → Read, a "file" attachment, or cat/head/grep via Bash on a memory file
-//   write → Write/Edit, or a redirect/sed -i via Bash on a memory file
+//   write → Write/Edit, or a redirect/sed -i via Bash on a memory file. A 5th field tells
+//           whole-file writes ('W': Write, > redirect, tee, cp, mv) from edits ('E')
 //   dir   → the memory folder the session was given in its system prompt (even if it is empty)
 //
 // The cache stores each transcript's events and only re-reads the ones that changed
@@ -15,17 +16,18 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 
-const CACHE_VERSION = 2;
+const CACHE_VERSION = 3;
 const NEEDLE = Buffer.from('/memory/');
 const MEMRE = /\/projects\/(-[^/\s"'`\\]+)\/memory\/([\w.\-]+\.md)/g;
 const RESCAN_AFTER_MS = 20_000;
 
-export function createUsageIndex({ projectsDir, cacheFile }) {
-  let cache = loadCache(cacheFile);
+export function createUsageIndex({ projectsDir, cacheFile, legacyCacheFile = null }) {
+  let cache = cacheFile ? loadCache(cacheFile, legacyCacheFile, projectsDir) : { version: CACHE_VERSION, files: {} };
   let status = 'idle';
   let progress = { done: 0, total: 0 };
   let lastScan = 0;
-  let summary = Object.keys(cache.files).length ? aggregate(cache) : null;
+  let summary = null, timeline = null; // timeline: served on its own endpoint, it can be large
+  if (Object.keys(cache.files).length) ({ summary, timeline } = aggregate(cache));
   let scanning = null;
 
   async function scan() {
@@ -47,7 +49,7 @@ export function createUsageIndex({ projectsDir, cacheFile }) {
       const prev = cache.files[full];
       if (!prev || prev.deleted || prev.mtime !== st.mtimeMs || prev.size !== st.size) {
         try {
-          cache.files[full] = { mtime: st.mtimeMs, size: st.size, ...describe(projectsDir, full), ...(await parseFile(full)) };
+          cache.files[full] = { v: CACHE_VERSION, mtime: st.mtimeMs, size: st.size, ...describe(projectsDir, full), ...(await parseFile(full)) };
           changed = true;
         } catch (e) { /* half-written or unreadable file: retried on the next scan */ }
       }
@@ -57,8 +59,8 @@ export function createUsageIndex({ projectsDir, cacheFile }) {
       if (!seen.has(full) && !entry.deleted) { entry.deleted = true; changed = true; }
     }
     if (changed || !summary) {
-      summary = aggregate(cache);
-      saveCache(cacheFile, cache);
+      ({ summary, timeline } = aggregate(cache));
+      if (cacheFile) saveCache(cacheFile, cache);
     }
     lastScan = Date.now();
     summary.scan = { ms: lastScan - started, at: new Date(lastScan).toISOString(), cacheFile };
@@ -78,22 +80,25 @@ export function createUsageIndex({ projectsDir, cacheFile }) {
       refresh();
       return { status: summary && status === 'scanning' ? 'refreshing' : status, progress, data: summary };
     },
+    timeline() {
+      return { at: summary?.scan?.at || null, ...(timeline || { events: [], sessions: {} }) };
+    },
   };
 }
 
 // --- Cache ---
-function loadCache(file) {
-  try {
-    const c = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (c.version === CACHE_VERSION) return c;
-    // Older cache: re-parse transcripts still on disk, but keep the events of deleted ones
-    // (they cannot be re-read and are the only record of that usage).
-    if (c.version < CACHE_VERSION && c.files) {
-      for (const entry of Object.values(c.files)) if (!entry.deleted) entry.mtime = -1;
-      return { version: CACHE_VERSION, files: c.files };
-    }
-  } catch {}
-  return { version: CACHE_VERSION, files: {} };
+const readJSON = file => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } };
+function loadCache(file, legacyFile, projectsDir) {
+  // First run with this cache file: older versions kept every data folder in one shared cache,
+  // so take over the entries that belong to this folder (they may be the only copy left).
+  const c = readJSON(file) || (legacyFile && readJSON(legacyFile));
+  if (!c?.files || !(c.version <= CACHE_VERSION)) return { version: CACHE_VERSION, files: {} };
+  const prefix = projectsDir + path.sep;
+  const files = Object.fromEntries(Object.entries(c.files).filter(([full]) => full.startsWith(prefix)));
+  // Older cache: re-parse transcripts still on disk, but keep the events of deleted ones
+  // (they cannot be re-read and are the only record of that usage).
+  if (c.version < CACHE_VERSION) for (const entry of Object.values(files)) if (!entry.deleted) entry.mtime = -1;
+  return { version: CACHE_VERSION, files };
 }
 function saveCache(file, cache) {
   try {
@@ -129,8 +134,11 @@ async function parseFile(full) {
       lastStart = start;
       const line = buf.toString('utf8', start, end);
       // Only attachments and tool calls matter; avoids parsing huge dumps.
-      // The system prompt names the session's memory folder; read it without parsing the (huge) line
-      const dir = line.match(/file-based memory at `?[^`\s"]*\/projects\/(-[^/`\s"\\]+)\/memory/);
+      // The system prompt names the session's memory folder; read it without parsing the (huge)
+      // line, and only from the lines that carry the prompt itself (not from pasted or printed text,
+      // where quotes would be escaped)
+      const prompt = line.includes('"type":"prompt_snapshot"') || line.includes('"type":"api-request-shape"');
+      const dir = prompt && line.match(/file-based memory at `?[^`\s"]*\/projects\/(-[^/`\s"\\]+)\/memory/);
       if (dir && !ev.some(e => e[0] === 'dir' && e[2] === dir[1])) ev.push(['dir', line.match(/"timestamp":"([^"]+)"/)?.[1] || null, dir[1]]);
       if (line.includes('"AutoMem"') || line.includes('"tool_use"') || line.includes('"type":"file"')) {
         try { extract(JSON.parse(line), ev); } catch {}
@@ -166,7 +174,7 @@ function extract(d, ev) {
     const inp = c.input || {};
     if (['Read', 'Write', 'Edit', 'MultiEdit'].includes(c.name)) {
       const [ref] = memRefs(inp.file_path);
-      if (ref) ev.push([c.name === 'Read' ? 'read' : 'write', ts, ref[0], ref[1]]);
+      if (ref) ev.push(c.name === 'Read' ? ['read', ts, ref[0], ref[1]] : ['write', ts, ref[0], ref[1], c.name === 'Write' ? 'W' : 'E']);
     } else if (c.name === 'Bash') {
       const cmd = String(inp.command || '');
       const seen = new Set();
@@ -175,7 +183,8 @@ function extract(d, ev) {
         seen.add(mp + file);
         const esc = file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const writes = new RegExp(`(>>?|\\btee\\b|sed -i|\\bmv\\b|\\bcp\\b|\\brm\\b)[^|;&]*${esc}`).test(cmd);
-        ev.push([writes ? 'write' : 'read', ts, mp, file]);
+        const whole = new RegExp(`((^|[^>])>(?!>)|\\btee\\b(?!\\s+-a)|\\bmv\\b|\\bcp\\b)[^|;&]*${esc}`).test(cmd);
+        ev.push(writes ? ['write', ts, mp, file, whole ? 'W' : 'E'] : ['read', ts, mp, file]);
       }
     }
   }
@@ -191,7 +200,7 @@ function weekOf(ts) {
 }
 
 function aggregate(cache) {
-  const timeline = [];          // [ts, 'read'|'write', mp, file, sid], every individual event
+  const timeline = [];          // [ts, 'read'|'write', mp, file, sid, op], every individual event
   const sessionInfo = new Map(); // sid → { cwd, first, last }
   const memories = {};   // "mp/file" → usage
   const projects = {};   // mp → index loads, sessions…
@@ -218,8 +227,11 @@ function aggregate(cache) {
     if (f.first && (!info.first || f.first < info.first)) info.first = f.first;
     if (f.last && (!info.last || f.last > info.last)) info.last = f.last;
     sessionInfo.set(f.sid, info);
-    for (const [kind, ts, mp, file, len] of f.ev) {
-      if ((kind === 'read' || kind === 'write') && file !== 'MEMORY.md') timeline.push([ts, kind, mp, file, f.sid]);
+    // Transcripts parsed before v3 have no reliable 'dir' events: assume the session's own folder
+    if (!f.v && !f.side && f.tdir && !f.ev.some(e => e[0] === 'dir')) proj(f.tdir).dirSessions.add(f.sid);
+    for (const [kind, ts, mp, file, extra] of f.ev) {
+      if ((kind === 'read' || kind === 'write') && file !== 'MEMORY.md') timeline.push([ts, kind, mp, file, f.sid, extra || null]);
+      const len = kind === 'load' ? extra : null;
       const w = weekOf(ts);
       if (kind === 'dir') { proj(mp).dirSessions.add(f.sid); continue; }
       if (kind === 'load') {
@@ -258,7 +270,8 @@ function aggregate(cache) {
     return { week: w, sessions: v.sessions.size, by: v.by };
   });
 
-  return {
+  const events = timeline.filter(e => e[0]).sort((a, b) => a[0].localeCompare(b[0]));
+  const summary = {
     window: { from, to, sessions: sessions.size, files, deletedFiles },
     memories: Object.fromEntries(Object.entries(memories).map(([k, m]) => [k, { ...m, sessions: [...m.sessions] }])),
     projects: Object.fromEntries(Object.entries(projects).map(([mp, p]) => [mp, {
@@ -269,7 +282,9 @@ function aggregate(cache) {
       index: Object.entries(p.index).sort(([a], [b]) => a.localeCompare(b)),
     }])),
     weekly,
-    timeline: timeline.filter(e => e[0]).sort((a, b) => a[0].localeCompare(b[0])),
-    sessions: Object.fromEntries([...new Set(timeline.map(e => e[4]))].map(sid => [sid, sessionInfo.get(sid) || {}])),
+  };
+  return {
+    summary,
+    timeline: { events, sessions: Object.fromEntries([...new Set(events.map(e => e[4]))].map(sid => [sid, sessionInfo.get(sid) || {}])) },
   };
 }

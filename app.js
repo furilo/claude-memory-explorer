@@ -32,6 +32,7 @@ const ICONS = {
 let data = { projects: [], emptyDirs: [] };
 let all = [];                    // flattened memories, each with .project
 let usage = { status: 'loading', data: null, progress: null };
+let tl = { at: null, events: [], sessions: {} }; // /api/timeline, fetched once per finished scan
 // view = tab; project = scope ('*' = all); selProject/file = open memory
 const state = {
   view: 'memories', project: '*', selProject: null, file: null, q: '', types: new Set(), sort: 'recent',
@@ -54,15 +55,22 @@ window.addEventListener('hashchange', () => { readHash(); render(); });
 // ---------- Loading ----------
 async function loadMemories() {
   data = await (await fetch('/api/memories')).json();
+  for (const p of data.projects) for (const m of p.memories) m.body = m.raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '').trim();
   all = data.projects.flatMap(p => p.memories.map(m => ({ ...m, project: p })));
 }
 let usageTimer = null;
 async function loadUsage() {
   clearTimeout(usageTimer);
+  const prevAt = usage.data?.scan?.at;
   try { usage = await (await fetch('/api/usage')).json(); } catch { usage = { status: 'error', data: null }; }
+  const at = usage.data?.scan?.at;
+  if (at && at !== tl.at) {
+    try { tl = await (await fetch('/api/timeline')).json(); } catch {}
+  }
   // poll every second while the transcripts are being scanned
   if (usage.status === 'scanning' || usage.status === 'refreshing') usageTimer = setTimeout(loadUsage, 1000);
-  render();
+  // while a refresh runs the data is unchanged: only the sidebar status needs updating
+  if (at && at === prevAt) renderSidebar(); else render();
 }
 async function load() {
   await loadMemories();
@@ -137,7 +145,9 @@ function srcInline(s, project) {
   s = s.replace(/\*\*([^*]+)\*\*/g, (_, t) => `<strong>${mk('**')}${t}${mk('**')}</strong>`);
   s = s.replace(/(^|[^*\w])\*([^*\s][^*]*)\*/g, (_, p, t) => `${p}<em>${mk('*')}${t}${mk('*')}</em>`);
   s = s.replace(/(^|[^\w\u0001])_([^_\s][^_]*)_(?=\W|$)/g, (_, p, t) => `${p}<em>${mk('_')}${t}${mk('_')}</em>`);
-  return s.replace(/\u0001(\d+)\u0001/g, (_, i) => stash[i]);
+  // a stashed fragment can contain earlier placeholders (code inside a link label), so restore recursively
+  const restore = t => t.replace(/\u0001(\d+)\u0001/g, (_, i) => restore(stash[i]));
+  return restore(s);
 }
 const unquote = v => v.replace(/^(["'])(.*)\1$/, '$2');
 function relTime(iso) {
@@ -588,18 +598,31 @@ const shortCwd = cwd => {
 function timelineItems(mems) {
   const byKey = new Map(mems.map(m => [`${m.project.id}/${m.file}`, m]));
   const projectIds = new Set(mems.map(m => m.project.id));
-  const U = usage.data;
-  const events = (U?.timeline || []).filter(e => projectIds.has(e[2]));
-  const writesOf = new Map();
-  for (const e of events) if (e[1] === 'write') (writesOf.get(`${e[2]}/${e[3]}`) || writesOf.set(`${e[2]}/${e[3]}`, []).get(`${e[2]}/${e[3]}`)).push(Date.parse(e[0]));
+  const events = tl.events.filter(e => projectIds.has(e[2])); // sorted by time, oldest first
+  const firstTs = new Map(), writesOf = new Map();
+  for (const [ts, kind, mp, file] of events) {
+    const key = `${mp}/${file}`;
+    if (!firstTs.has(key)) firstTs.set(key, Date.parse(ts));
+    if (kind === 'write') (writesOf.get(key) || writesOf.set(key, []).get(key)).push(Date.parse(ts));
+  }
   const near = (key, ts, ms = 5 * 60000) => (writesOf.get(key) || []).some(t => Math.abs(t - ts) < ms);
 
   // transcript events → per (day, session) groups
+  // A write is a creation when it is the first event seen for that file and it wrote the whole file
+  // (Write, > redirect…), unless the file was clearly born earlier. Events cached by older versions
+  // have no op: fall back to comparing with the file's birth time.
+  const createdBy = new Set(); // memories whose creation a transcript recorded
   const groups = new Map();
-  for (const [ts, kind, mp, file, sid] of events) {
-    const key = `${mp}/${file}`, m = byKey.get(key);
-    const created = m ? Date.parse(m.created) : NaN;
-    const k = kind === 'read' ? 'read' : (Math.abs(Date.parse(ts) - created) < 5 * 60000 ? 'created' : 'edited');
+  for (const [ts, kind, mp, file, sid, op] of events) {
+    const key = `${mp}/${file}`, m = byKey.get(key), t = Date.parse(ts);
+    const born = m?.createdExact ? Date.parse(m.created) : NaN;
+    let k = 'read';
+    if (kind === 'write') {
+      const first = firstTs.get(key) === t && !createdBy.has(key);
+      const isNew = op ? op === 'W' && !(born < t - 3600000) : Math.abs(t - born) < 5 * 60000;
+      k = first && isNew ? 'created' : 'edited';
+      if (k === 'created') createdBy.add(key);
+    }
     const gk = dayKey(ts) + '|' + sid;
     const g = groups.get(gk) || { type: 'session', day: dayKey(ts), sid, first: ts, last: ts, rows: new Map() };
     if (ts < g.first) g.first = ts;
@@ -612,29 +635,42 @@ function timelineItems(mems) {
   }
   const items = [...groups.values()].map(g => ({ ...g, ts: g.last, rows: [...g.rows.values()].sort((a, b) => b.ts.localeCompare(a.ts)) }));
 
-  // file dates, when no transcript write explains them
+  // file dates, when no transcript explains them. The birth time only counts when the filesystem
+  // has a real one and no transcript saw the file before it (an atomic rewrite resets it).
   for (const m of mems) {
     const key = `${m.project.id}/${m.file}`, c = Date.parse(m.created), mo = Date.parse(m.modified);
-    if (!isNaN(c) && !near(key, c)) items.push({ type: 'file', kind: 'created', ts: m.created, day: dayKey(m.created), m, key });
-    if (!isNaN(mo) && mo - c > 3600000 && !near(key, mo)) items.push({ type: 'file', kind: 'edited', ts: new Date(mo).toISOString(), day: dayKey(mo), m, key });
+    const bornOk = m.createdExact && !isNaN(c) && !createdBy.has(key) && !(firstTs.get(key) < c - 5 * 60000) && !near(key, c);
+    if (bornOk) items.push({ type: 'file', kind: 'created', ts: m.created, day: dayKey(m.created), m, key });
+    if (!isNaN(mo) && (!m.createdExact || mo - c > 3600000) && !near(key, mo)) items.push({ type: 'file', kind: 'edited', ts: new Date(mo).toISOString(), day: dayKey(mo), m, key });
   }
   return items.sort((a, b) => b.ts.localeCompare(a.ts));
 }
 
-function heatmap(items) {
-  // count events per day (a session group counts each of its rows)
+// Keep only the rows of the enabled kinds
+const filterKinds = (items, on) => items.map(it => it.type === 'file' ? (on.has(it.kind) ? it : null)
+  : (() => { const rows = it.rows.filter(r => on.has(r.kind)); return rows.length ? { ...it, rows } : null; })()).filter(Boolean);
+// One pass: events per day and kind (a session group counts each of its rows), plus sessions
+function dayCounts(items) {
   const perDay = new Map();
   for (const it of items) {
-    const c = perDay.get(it.day) || { created: 0, edited: 0, read: 0 };
-    if (it.type === 'file') c[it.kind]++; else for (const r of it.rows) c[r.kind] += r.n;
-    perDay.set(it.day, c);
+    const c = perDay.get(it.day) || perDay.set(it.day, { created: 0, edited: 0, read: 0, sessions: 0 }).get(it.day);
+    if (it.type === 'file') c[it.kind]++;
+    else { c.sessions++; for (const r of it.rows) c[r.kind] += r.n; }
   }
+  return perDay;
+}
+
+const HEATMAP_WEEKS = 53;
+function heatmap(perDay) {
   if (!perDay.size) return '';
   const total = c => c.created + c.edited + c.read;
   const max = Math.max(...[...perDay.values()].map(total));
-  const first = new Date([...perDay.keys()].sort()[0] + 'T12:00:00');
-  first.setDate(first.getDate() - ((first.getDay() + 6) % 7)); // back to Monday
   const today = new Date(); today.setHours(12, 0, 0, 0);
+  // from the oldest activity, but at most a year back (one old file date would stretch it for years)
+  const oldest = new Date([...perDay.keys()].sort()[0] + 'T12:00:00');
+  const limit = new Date(today); limit.setDate(limit.getDate() - 7 * (HEATMAP_WEEKS - 1));
+  const first = oldest < limit ? limit : oldest;
+  first.setDate(first.getDate() - ((first.getDay() + 6) % 7)); // back to Monday
   let cols = '', months = '', week = 0, lastMonth = -1;
   for (const d = new Date(first); d <= today; d.setDate(d.getDate() + 7), week++) {
     if (d.getMonth() !== lastMonth) { months += `<span style="grid-column:${week + 1}">${d.toLocaleDateString(LOCALE, { month: 'short' })}</span>`; lastMonth = d.getMonth(); }
@@ -658,9 +694,12 @@ function renderTimeline() {
   const mems = scoped(), proj = projectById(state.project), U = usage.data;
   const allItems = timelineItems(mems);
   const on = state.tlKinds;
-  const items = allItems.map(it => it.type === 'file' ? (on.has(it.kind) ? it : null)
-    : (() => { const rows = it.rows.filter(r => on.has(r.kind)); return rows.length ? { ...it, rows } : null; })()).filter(Boolean);
-  const count = k => allItems.reduce((a, it) => a + (it.type === 'file' ? +(it.kind === k) : it.rows.filter(r => r.kind === k).reduce((x, r) => x + r.n, 0)), 0);
+  const items = filterKinds(allItems, on);
+  // chips count every kind (so a disabled one still shows its total); the heatmap and the day
+  // headers follow the filter, so every heatmap day links to a day in the list
+  const totals = { created: 0, edited: 0, read: 0 };
+  for (const c of dayCounts(allItems).values()) for (const k in totals) totals[k] += c[k];
+  const perDay = dayCounts(items);
   const memLink = (m, key) => m ? `<a class="tl-mem" href="${memHref(m.project.id, m.file)}"><i style="background:${typeColor(m.type)}"></i>${esc(m.name)}</a>`
     : `<span class="tl-mem gone"><i></i>${esc(key.split('/').pop())}<small>deleted</small></span>`;
   const kindBadge = k => `<span class="tl-kind ${k}">${TL_KINDS[k]}</span>`;
@@ -669,10 +708,8 @@ function renderTimeline() {
   let html = '', lastDay = null;
   for (const it of items) {
     if (it.day !== lastDay) {
-      const dayItems = items.filter(x => x.day === it.day);
-      const sessions = dayItems.filter(x => x.type === 'session').length;
-      const n = k => dayItems.reduce((a, x) => a + (x.type === 'file' ? +(x.kind === k) : x.rows.filter(r => r.kind === k).reduce((s, r) => s + r.n, 0)), 0);
-      const sum = [n('created') && `${n('created')} created`, n('edited') && `${n('edited')} edited`, n('read') && plural(n('read'), 'read', 'reads'), sessions && plural(sessions, 'session', 'sessions')].filter(Boolean).join(' · ');
+      const c = perDay.get(it.day);
+      const sum = [c.created && `${c.created} created`, c.edited && `${c.edited} edited`, c.read && plural(c.read, 'read', 'reads'), c.sessions && plural(c.sessions, 'session', 'sessions')].filter(Boolean).join(' · ');
       html += `${lastDay ? '</div>' : ''}<div class="tl-day" id="day-${it.day}"><div class="tl-date"><b>${new Date(it.day + 'T12:00:00').toLocaleDateString(LOCALE, { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' })}</b><span>${sum}</span></div>`;
       lastDay = it.day;
     }
@@ -681,7 +718,7 @@ function renderTimeline() {
         <div class="tl-body">${kindBadge(it.kind)} ${memLink(it.m, it.key)}${proj ? '' : `<span class="tl-proj">${esc(projLabel(it.m.project))}</span>`}
         <span class="tl-src" data-tip="${esc('From the file dates: no analysed transcript recorded this change')}">file date</span></div></div>`;
     } else {
-      const info = U?.sessions?.[it.sid] || {};
+      const info = tl.sessions?.[it.sid] || {};
       html += `<div class="tl-item tl-session"><span class="tl-time">${time(it.last)}</span><span class="tl-dot session"></span>
         <div class="tl-body"><div class="tl-shead">${ICONS.terminal}<span data-tip="${esc(`Session ${it.sid}\n${info.cwd || ''}`)}">${esc(shortCwd(info.cwd))}</span>
           <code>${esc(it.sid.slice(0, 8))}</code><span class="muted">${time(it.first) === time(it.last) ? '' : `${time(it.first)}–${time(it.last)}`}</span></div>
@@ -693,9 +730,9 @@ function renderTimeline() {
 
   $('#detail').innerHTML = `<div class="page page-timeline">
     <header class="page-head"><h2>Timeline</h2><p>${esc(proj ? projLabel(proj) : 'all projects')} · every memory event, newest first</p></header>
-    ${heatmap(allItems)}
+    ${heatmap(perDay)}
     <div class="tl-bar">
-      ${Object.entries(TL_KINDS).map(([k, l]) => `<button class="chip tl-chip ${on.has(k) ? 'on' : ''}" data-tlkind="${k}"><span class="tl-dot ${k}"></span>${l} ${count(k)}</button>`).join('')}
+      ${Object.entries(TL_KINDS).map(([k, l]) => `<button class="chip tl-chip ${on.has(k) ? 'on' : ''}" data-tlkind="${k}"><span class="tl-dot ${k}"></span>${l} ${totals[k]}</button>`).join('')}
       <span class="muted small">${U ? `Reads and session details come from ${windowText()}; older creations and edits come from file dates.` : 'Scanning transcripts… reads will appear when it finishes.'}</span>
     </div>
     <div class="timeline">${html || '<div class="empty">Nothing to show</div>'}</div>
@@ -992,8 +1029,10 @@ $('#detail').addEventListener('click', e => {
   const c = e.target.closest('[data-copy]');
   if (c) {
     navigator.clipboard.writeText(c.dataset.copy);
-    if (c.classList.contains('icon-btn')) { const prev = c.innerHTML; c.innerHTML = ICONS.check; setTimeout(() => c.innerHTML = prev, 1200); }
-    else { c.textContent = 'copied ✓'; setTimeout(() => c.textContent = 'copy path', 1200); }
+    const icon = c.classList.contains('icon-btn');
+    if (icon) c.innerHTML = ICONS.check; else c.textContent = 'copied ✓';
+    clearTimeout(c._reset); // repeated clicks: restore the original label, never the checkmark
+    c._reset = setTimeout(() => { if (icon) c.innerHTML = ICONS.copy; else c.textContent = 'copy path'; }, 1200);
   }
   const tk = e.target.closest('[data-tlkind]');
   if (tk) { const k = tk.dataset.tlkind; state.tlKinds.has(k) ? state.tlKinds.delete(k) : state.tlKinds.add(k); return renderTimeline(); }
